@@ -1,0 +1,142 @@
+import boto3
+
+# Initialize the Boto3 clients for the required AWS services
+ec2_client = boto3.client('ec2')
+autoscaling_client = boto3.client('autoscaling')
+elbv2_client = boto3.client('elbv2')
+
+# Define variables
+vpc_name = 'QubeVpc'
+subnet_cidr_block = '10.0.1.0/24'
+public_subnet_cidr_block = '10.0.2.0/24'
+instance_type = 't2.micro'
+ami_id = 'ami-xxxxxxxxxxxxx'  # Replace with the Amazon Linux 2 AMI ID
+httpd_user_data = """#!/bin/bash
+yum install -y httpd
+systemctl start httpd
+echo "helloworld" > /opt/launchfile
+"""
+
+# Create VPC
+vpc_response = ec2_client.create_vpc(CidrBlock=subnet_cidr_block)
+vpc_id = vpc_response['Vpc']['VpcId']
+ec2_client.create_tags(Resources=[vpc_id], Tags=[{'Key': 'Product', 'Value': 'challenge'}])
+
+# Create public and private subnets
+subnet_response = ec2_client.create_subnet(VpcId=vpc_id, CidrBlock=subnet_cidr_block)
+subnet_id = subnet_response['Subnet']['SubnetId']
+ec2_client.create_tags(Resources=[subnet_id], Tags=[{'Key': 'Product', 'Value': 'challenge'}])
+
+public_subnet_response = ec2_client.create_subnet(VpcId=vpc_id, CidrBlock=public_subnet_cidr_block)
+public_subnet_id = public_subnet_response['Subnet']['SubnetId']
+ec2_client.create_tags(Resources=[public_subnet_id], Tags=[{'Key': 'Product', 'Value': 'challenge'}])
+
+# Create security group for EC2 instances
+security_group_response = ec2_client.create_security_group(
+    GroupName='web-server-sg',
+    Description='Security group for web servers',
+    VpcId=vpc_id
+)
+security_group_id = security_group_response['GroupId']
+ec2_client.authorize_security_group_ingress(
+    GroupId=security_group_id,
+    IpPermissions=[
+        {
+            'IpProtocol': 'tcp',
+            'FromPort': 80,
+            'ToPort': 80,
+            'IpRanges': [{'CidrIp': '0.0.0.0/0'}]
+        },
+        {
+            'IpProtocol': 'tcp',
+            'FromPort': 22,
+            'ToPort': 22,
+            'IpRanges': [{'CidrIp': '0.0.0.0/0'}]
+        }
+    ]
+)
+
+# Create IAM role and policies for EC2 instances to read SQS queues (assuming the role exists)
+# Replace 'arn:aws:iam::YOUR_ACCOUNT_ID:role/your-ec2-role' with the actual IAM role ARN
+
+# Create Launch Template
+launch_template_response = ec2_client.create_launch_template(
+    LaunchTemplateName='my-launch-template',
+    VersionDescription='Initial version',
+    LaunchTemplateData={
+        'InstanceType': instance_type,
+        'IamInstanceProfile': {'Arn': 'arn:aws:iam::YOUR_ACCOUNT_ID:role/your-ec2-role'},
+        'UserData': httpd_user_data,
+        'TagSpecifications': [
+            {
+                'ResourceType': 'instance',
+                'Tags': [{'Key': 'Product', 'Value': 'challenge'}]
+            }
+        ]
+    }
+)
+launch_template_id = launch_template_response['LaunchTemplate']['LaunchTemplateId']
+
+# Create Auto Scaling Group
+autoscaling_response = autoscaling_client.create_auto_scaling_group(
+    AutoScalingGroupName='my-asg',
+    LaunchTemplate={'LaunchTemplateId': launch_template_id},
+    MinSize=1,
+    MaxSize=1,
+    DesiredCapacity=1,
+    AvailabilityZones=['us-east-1a'],  # Replace with your desired AZ
+    VPCZoneIdentifier=subnet_id,
+    Tags=[
+        {
+            'Key': 'Product',
+            'Value': 'challenge',
+            'PropagateAtLaunch': True
+        }
+    ]
+)
+
+# Create Application Load Balancer
+alb_response = elbv2_client.create_load_balancer(
+    Name='my-alb',
+    Subnets=[public_subnet_id],
+    SecurityGroups=[security_group_id],
+    Scheme='internet-facing'
+)
+
+# Create Target Group
+target_group_response = elbv2_client.create_target_group(
+    Name='my-target-group',
+    Protocol='HTTP',
+    Port=80,
+    VpcId=vpc_id
+)
+
+# Register targets (EC2 instances) with the target group
+elbv2_client.register_targets(
+    TargetGroupArn=target_group_response['TargetGroups'][0]['TargetGroupArn'],
+    Targets=[
+        {'Id': autoscaling_response['AutoScalingGroups'][0]['Instances'][0]['InstanceId']}
+    ]
+)
+
+# Create Listener Rule to forward requests
+elbv2_client.create_rule(
+    ListenerArn=alb_response['LoadBalancers'][0]['ListenerArn'],
+    Conditions=[
+        {
+            'Field': 'path-pattern',
+            'Values': ['/worldsogood']
+        }
+    ],
+    Priority=1,
+    Actions=[
+        {
+            'Type': 'fixed-response',
+            'FixedResponseConfig': {
+                'ContentType': 'text/plain',
+                'StatusCode': '200',
+                'ContentBody': 'Hello world python'
+            }
+        }
+    ]
+)
